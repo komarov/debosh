@@ -1,0 +1,479 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+    debosh
+
+=head1 DESCRIPTION
+
+    Instant debian packaging
+    See http://github.com/komarov/debosh/README for details
+
+=head1 SYNOPSIS
+
+    do stuff
+        debosh
+
+    specify source url
+        debosh --url git://repo_url
+        debosh --url http://repo_url.git
+        debosh --url svn+ssh://repo_url
+
+    resolve ambiguity if more than one repo url was found
+        debosh --repo-type svn
+
+    use local working copy
+        debosh --dirty
+
+    use specific svn revision
+        debosh --svn-rev 567 
+
+    don't run tests
+        debosh --no-tests
+
+    redefine output directory (default is ./debian)
+        debosh --debdir ../debian
+
+    check that all Perl dependencies are listed in meta.yaml "requires" section
+        debosh --strict
+        debosh -s
+
+    leave tmp dir with generated debian control, rules, etc.
+        debosh --no-cleanup
+
+    show this help message
+        debosh --help
+        debosh -h
+
+=head1 COMMENTS
+
+=cut
+
+use strict;
+use warnings;
+use open ':std' => ':utf8';
+use utf8;
+
+use Cwd qw/getcwd/;
+use File::Find qw/find/;
+use File::Slurp;
+use File::Temp qw/tempdir/;
+use File::Type;
+use Getopt::Long;
+use List::MoreUtils qw/none uniq/;
+use Module::Info;
+use YAML;
+
+my $CLEANUP = 1;
+my $DEBDIR = undef;
+my $DIRTY = 0;
+my $REPO_TYPE = undef;
+my $RUN_TESTS = 1;
+my $STRICT = 0;
+my $SVN_REV = 'HEAD';
+my $URL = undef;
+GetOptions(
+    'cleanup!' => \$CLEANUP,
+    'debdir=s' => \$DEBDIR,
+    'dirty' => \$DIRTY,
+    'h|help' => \&usage,
+    'repo-type=s' => \$REPO_TYPE,
+    's|strict' => \$STRICT,
+    'svn-rev=s' => \$SVN_REV,
+    'tests!' => \$RUN_TESTS,
+    'url=s' => \$URL,
+);
+
+my $start_dir = getcwd();
+my $work_dir  = tempdir(CLEANUP => $CLEANUP);
+print "Created working directory $work_dir\n";
+
+my ($source_dir, $obtained_url);
+if ($DIRTY) {
+    $source_dir = $start_dir;
+} else {
+    ($source_dir, $obtained_url) = obtain_source($work_dir,
+        svn_rev => $SVN_REV,
+        url => $URL,
+        repo_type => $REPO_TYPE,
+    );
+}
+my $package_info = get_package_info($source_dir,
+    dirty => $DIRTY,
+    strict => $STRICT,
+);
+$package_info->{url} = $obtained_url;
+
+if ($package_info->{dir_layout}->{t} && $RUN_TESTS) {
+    my $error = system("prove -I$source_dir/lib -r $source_dir/t");
+    die "testing failed: $?" if $error;
+}
+
+my $package_dir = "$work_dir/package";
+mkdir $package_dir or die "Can't mkdir '$package_dir'";
+create_debian_files($package_info, $package_dir, $source_dir);
+chdir $package_dir;
+my $error = system('dpkg-buildpackage -rfakeroot');
+die "packaging failed: $?" if $error;
+
+opendir(my $dh, $work_dir);
+my @files = readdir($dh);
+my @deb_files = grep {-f "$work_dir/$_"} @files;
+closedir($dh);
+die "No deb files in '$work_dir'" unless @deb_files;
+
+chdir $start_dir;
+my $debian_dir = $DEBDIR || "$start_dir/debian";
+unless (-d $debian_dir) {
+    mkdir $debian_dir or die "Can't mkdir '$debian_dir'";
+}
+for my $deb_file (@deb_files) {
+    system('cp', "$work_dir/$deb_file", "$debian_dir");
+}
+
+exit;
+
+
+=head2 obtain_source
+
+    Checkouts a clean working copy
+    Possible options
+        repo_type - git or svn
+        url - checkout from provided url
+        svn_rev - checkout a specific svn revision
+
+=cut
+
+sub obtain_source
+{
+    my ($work_dir, %O) = @_;
+
+    my %repo_url = ();
+    if (my $url = $O{url}) {
+        if ($url =~ /(?:^git:|^ssh:|\.git$)/) {
+            $repo_url{git} = $url;
+        }
+        if ($url =~ /^svn\+/) {
+            $repo_url{svn} = $url;
+        }
+    } else {
+        if (-f '.git/config' and my ($git_url) = grep {/url = /} `cat .git/config`) {
+            $git_url =~ /url = (\S+)/;
+            $repo_url{git} = $1;
+        }
+        if (-d '.svn' and my ($svn_url) = grep {/^URL: /} `svn info`) {
+            $svn_url =~ /URL: (\S+)/;
+            $repo_url{svn} = $1;
+        }
+    }
+    if (my $repo_type = $O{repo_type}) {
+        die "Unknown repo-type '$repo_type'" unless $repo_type =~ /^(?:git|svn)$/;
+        delete $repo_url{$_} for grep {$_ ne $repo_type} keys %repo_url;
+    }
+
+    my $found_urls_number = scalar grep {$_} values %repo_url;
+    if ($found_urls_number == 0) {
+        die "Could not determine the repo url\nProvide --url or use --dirty";
+    }
+    if ($found_urls_number > 1) {
+        die "Could not determine the repo type\nUse --repo-type git|svn";
+    }
+
+    my $source_dir = "$work_dir/source";
+    my $obtained_url;
+    if (my $git_url = $repo_url{git}) {
+        my $error = system("git clone $git_url $source_dir");
+        die "failed to obtain source: $?" if $error;
+        $obtained_url = $git_url;
+    }
+    if (my $svn_url = $repo_url{svn}) {
+        my $error = system("svn co $svn_url\@$O{svn_rev} $source_dir");
+        die "failed to obtain source: $?" if $error;
+        # check that "changes" file is not older than the code
+        my ($last_changed_rev, $last_changed_rev_changes) = map {
+            my ($line) = grep {/^Last Changed Rev: /} `svn info $_`;
+            $line =~ /Last Changed Rev: (\d+)/;
+            $1;
+        } ($source_dir, "$source_dir/changes");
+
+        if ($last_changed_rev_changes < $last_changed_rev) {
+            die "too old 'changes' file: r$last_changed_rev_changes (project itself has r$last_changed_rev)";
+        }
+        $obtained_url = $svn_url;
+    }
+
+    return ($source_dir, $obtained_url);
+}
+
+
+=head2 get_package_info
+
+    Uses directory content to get package info
+    Possible options:
+      dirty - add "~dirty" suffix to package version
+      strict - die if a required package is not listed in meta.yaml
+
+=cut
+
+sub get_package_info
+{
+    my ($source_dir, %O) = @_;
+
+    opendir(my $dh, $source_dir);
+    my @dir_content = readdir($dh);
+    closedir($dh);
+
+    my $dir_layout = {};
+    # find dirs
+    $dir_layout->{$_} = 1 for grep {-d "$source_dir/$_"} qw/bin etc lib var t/;
+    # find files
+    $dir_layout->{$_} = 1 for grep {-f "$source_dir/$_"} qw/changes meta.yaml/;
+    die 'no changes file'   unless $dir_layout->{changes};
+    die 'no meta.yaml file' unless $dir_layout->{'meta.yaml'};
+    die 'none of bin, etc, lib dirs is present' if none {$dir_layout->{$_}} qw/bin etc lib/;
+
+    my $meta = YAML::Load(scalar read_file("$source_dir/meta.yaml"));
+    die "package is not specified" unless $meta->{package};
+    my $version = get_version(scalar read_file("$source_dir/changes"));
+    if ($O{dirty}) {
+        $version .= '~dirty';
+    }
+
+    $meta->{dir_layout} = $dir_layout;
+    $meta->{version}    = $version;
+    $meta->{requires} ||= {};
+    die "bad format of field 'requires'" unless ref($meta->{requires}) eq 'HASH';
+    $meta->{conflicts} ||= {};
+    die "bad format of field 'conflicts'" unless ref($meta->{conflicts}) eq 'HASH';
+    $meta->{perl_ignore} ||= [];
+    die "bad format of field 'perl_ignore'" unless ref($meta->{perl_ignore}) eq 'ARRAY';
+
+    for my $package (get_perl_deps($source_dir, $dir_layout, $meta->{perl_ignore})) {
+        unless(defined $meta->{requires}->{$package}) {
+            $meta->{requires}->{$package} = 0;
+            warn "Package $package is required but not specified in meta.yaml!";
+            die if $O{strict};
+        }
+    }
+
+    return $meta;
+}
+
+
+=head2 get_version
+
+    Parses "changes" to get the version number
+    Actually, just takes the first line and checks the format
+
+=cut
+
+sub get_version
+{
+    my $changes = shift;
+
+    my ($version) = split /\n/, $changes, 2;
+    $version =~ s/^\s+|\s+$//;
+    die "bad version string '$version'" unless $version =~ /^\d+(?:\.\d+)*$/;
+    return $version;
+}
+
+
+=head2 get_perl_deps
+
+    Checks Perl modules in "lib" and Perl scripts in "bin"
+    Returns a list of required debian packages
+
+=cut
+
+sub get_perl_deps
+{
+    my $source_dir = shift;
+    my $dir_layout = shift;
+    my $ignore_arr = shift;
+
+    my $current_dir = getcwd();
+    my $lib_dir;
+    if ($dir_layout->{lib}) {
+        $lib_dir = "$source_dir/lib";
+        chdir $lib_dir;
+        unshift @INC, $lib_dir;
+    }
+
+    my @perl_sources = ();
+    my $is_file = sub {-f $_[0] && $_[0] !~ /\.svn/};
+    my %find_rules = (
+        bin => sub { 
+            $is_file->($File::Find::name) && 
+            File::Type->new()->mime_type($File::Find::name) eq 'application/x-perl' && 
+            push @perl_sources, $File::Find::name 
+        },
+        lib => sub { $is_file->($File::Find::name) && /\.pm$/ && push @perl_sources, $File::Find::name },
+    );
+    for my $dir (grep {$dir_layout->{$_}} keys %find_rules) {
+        find($find_rules{$dir}, "$source_dir/$dir");
+    }
+    my %ignore = map { $_ => 1 } @$ignore_arr; 
+    my @modules = grep {!$ignore{$_}} uniq map {Module::Info->new_from_file($_)->modules_used()} @perl_sources;
+    my @deps = ();
+    foreach my $module (@modules) {
+        my $info = Module::Info->new_from_module($module) or die "Can't get info for module '$module'";
+        next if $info->is_core;
+        # stop searching if the $module is included in our package
+        next if $dir_layout->{lib} && $info->inc_dir eq $lib_dir;
+        my $file = $info->file;
+        my ($result) = `dpkg -S $file`;
+        die 'dpkg returned nothing' unless $result;
+        die "Can't resolve package name for module '$module', file '$file'" if $result =~ /not found/;
+        if ($result =~ /^([^:]+):/) {
+            push @deps, $1;
+        }
+    }
+    if ($dir_layout->{lib}) {
+        chdir $current_dir;
+        shift @INC;
+    }
+    return uniq @deps;
+}
+
+
+=head2 create_debian_files
+
+    Creates debian directory and files: changelog, compat, control, rules
+
+=cut
+
+sub create_debian_files
+{
+    my $package_info = shift;
+    my $package_dir  = shift;
+    my $source_dir   = shift;
+
+    my $debian_dir = "$package_dir/debian";
+    mkdir $debian_dir or die "Can't mkdir '$debian_dir'";
+
+    my $version = "$package_info->{version}-1";
+    my ($date) = `date -R`;
+
+    my $changelog = <<CHANGELOG;
+$package_info->{package} ($version) unstable; urgency=low
+
+  * next auto build
+
+ -- $ENV{DEBFULLNAME} <$ENV{DEBEMAIL}>  $date
+
+
+CHANGELOG
+    write_file("$debian_dir/changelog", {atomic => 1}, $changelog);
+
+    my $depends = join ",\n         ", 'perl', map {$_ . ($package_info->{requires}->{$_} ? " ($package_info->{requires}->{$_})" : '')} keys %{$package_info->{requires}};
+    my $conflicts = join ",\n         ", map {$_ . ($package_info->{conflicts}->{$_} ? " ($package_info->{conflicts}->{$_})" : '')} keys %{$package_info->{conflicts}};
+    my $control = <<CONTROL;
+Source: $package_info->{package}
+Section: unknown
+Priority: extra
+Maintainer: $ENV{DEBFULLNAME} <$ENV{DEBEMAIL}>
+Build-Depends: debhelper (>= 5)
+Standards-Version: 3.7.2
+Homepage: $package_info->{url}
+
+Package: $package_info->{package}
+Architecture: all
+Depends: $depends
+Conflicts: $conflicts
+Description: $package_info->{description}
+ $package_info->{description}
+Homepage: $package_info->{url}
+CONTROL
+    write_file("$debian_dir/control", {atomic => 1}, $control);
+
+    my $rules = <<RULES;
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+export DH_OPTIONS
+
+SOURCE = $source_dir
+DEST = debian
+DEST_MAIN = debian/$package_info->{package}
+
+build:
+	echo nop
+
+binary: install
+	echo nop
+
+clean:
+	dh_testdir
+	dh_testroot
+	dh_clean
+	rm -f build-arch-stamp build-indep-stamp #CONFIGURE-STAMP#
+
+	-\$(MAKE) clean
+
+	dh_clean
+
+install:
+	dh_testdir
+	dh_testroot
+	dh_clean -k -i
+	dh_installdirs
+
+%MAIN%
+	dh_perl
+	dh_installdeb
+	dh_gencontrol -- -v$version
+	dh_md5sums
+	dh_builddeb
+
+.PHONY: build clean install
+RULES
+
+    my $main = '';
+    my %dir_map = (
+        bin => 'usr/local/bin',
+        etc => 'etc',
+        lib => 'usr/share/perl5',
+        var => 'var',
+    );
+    for my $dir (grep {$package_info->{dir_layout}->{$_}} keys %dir_map) {
+        $main .= qq[\tinstall -d \${DEST_MAIN}/$dir_map{$dir}\n];
+        $main .= qq[\trsync -a --exclude=".svn" \${SOURCE}/$dir/ \${DEST_MAIN}/$dir_map{$dir}/\n];
+    }
+    $rules =~ s/%MAIN%/$main/;
+
+    write_file("$debian_dir/rules", {atomic => 1}, $rules);
+    write_file("$debian_dir/compat", {atomic => 1}, '5');
+    chmod 0755, "$debian_dir/rules";
+}
+
+
+=head2 usage
+
+    Displays usage message
+
+=cut 
+
+sub usage
+{
+    system("podselect -section SYNOPSIS -section DESCRIPTION $0 | pod2text >&2");
+    exit(1);
+}
+
+
+__END__
+
+=head1 AUTHOR
+
+    Oleg Komarov <komarov.om@gmail.com>
+
+=head1 CONTRIBUTORS
+
+    Elena Bolshakova <helena@cpan.org>
+    Sergey Zhuravlev <zhurs@ya.ru>
+
+=head1 LICENSE
+    
+    This file is free software; you can redistribute it and/or modify it
+    under the same terms as Perl itself.
+
+=cut

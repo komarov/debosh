@@ -1,0 +1,17 @@
+---
+  package: debosh
+  maintainer: Oleg Komarov <komarov.om@gmail.com>
+  description: instant debian packaging (mostly for Perl)
+  requires:
+    debhelper: 0
+    fakeroot: 0
+    git-core: 0
+    libfile-type-perl: 0
+    libfile-slurp-perl: 0
+    libfile-spec-perl: 0
+    libfile-temp-perl: 0
+    liblist-moreutils-perl: 0
+    libmodule-info-perl: 0
+    libyaml-perl: 0
+    rsync: 0
+    subversion: 0
