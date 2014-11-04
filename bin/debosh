@@ -74,6 +74,8 @@ my %DIR_MAP = (
     var  => 'var',
 );
 
+my @dpkg_actions = qw/preinst postinst prerm postrm/;
+
 my $CLEANUP = 1;
 my $DEBDIR = undef;
 my $DIRTY = 0;
@@ -238,6 +240,9 @@ sub get_package_info
     $dir_layout->{$_} = 1 for grep {-d "$source_dir/$_"} keys %DIR_MAP;
     # find files
     $dir_layout->{$_} = 1 for grep {-f "$source_dir/$_"} qw/changes meta.yaml/;
+    # dpkg scripts: postinst, prerm, etc.
+    $dir_layout->{dpkg_actions}->{$_} = 1 for grep {-f "$source_dir/actions/$_"} @dpkg_actions;
+
     die 'no changes file'   unless $dir_layout->{changes};
     die 'no meta.yaml file' unless $dir_layout->{'meta.yaml'};
     my @main_dirs = grep {$DIR_MAP{$_}} keys %DIR_MAP;
@@ -449,6 +454,11 @@ RULES
     write_file("$debian_dir/rules", {atomic => 1}, $rules);
     write_file("$debian_dir/compat", {atomic => 1}, '5');
     chmod 0755, "$debian_dir/rules";
+
+    for my $action (keys %{$package_info->{dir_layout}->{dpkg_actions}} ){
+        write_file("$debian_dir/$package_info->{package}.$action", {atomic => 1}, scalar read_file("$source_dir/actions/$action"));
+        chmod 0755, "$debian_dir/$package_info->{package}.$action";
+    }
 }
 
 

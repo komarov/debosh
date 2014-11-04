@@ -63,13 +63,17 @@ The following directories are recognized and their content is copied to target d
 * bin -> /usr/local/bin/
 * etc -> /etc/
 * lib -> /usr/share/perl5/
-* opt  => /opt/
-* sbin => /usr/local/sbin/
-* share => /usr/local/share/
+* opt -> /opt/
+* sbin -> /usr/local/sbin/
+* share -> /usr/local/share/
 * var -> /var/
 
 If `t` directory is present, the tests in it will be run before proceeding further.
 Use `--no-tests` option to skip this step.
+
+If `actions` directory is present and contains some of `preinst`, `postinst`, `prerm` or `postrm` files, 
+these files becomes package maintainer scripts. 
+See also [Debian Policy Manual](https://www.debian.org/doc/debian-policy/ch-maintainerscripts.html). 
 
 ### changes
 
