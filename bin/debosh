@@ -64,6 +64,16 @@ use List::MoreUtils qw/none uniq/;
 use Module::Info;
 use YAML;
 
+my %DIR_MAP = (
+    bin  => 'usr/local/bin',
+    etc  => 'etc',
+    lib  => 'usr/share/perl5',
+    opt  => 'opt',
+    sbin => 'usr/local/sbin',
+    share => 'usr/local/share',
+    var  => 'var',
+);
+
 my $CLEANUP = 1;
 my $DEBDIR = undef;
 my $DIRTY = 0;
@@ -225,12 +235,13 @@ sub get_package_info
 
     my $dir_layout = {};
     # find dirs
-    $dir_layout->{$_} = 1 for grep {-d "$source_dir/$_"} qw/bin etc lib var t/;
+    $dir_layout->{$_} = 1 for grep {-d "$source_dir/$_"} keys %DIR_MAP;
     # find files
     $dir_layout->{$_} = 1 for grep {-f "$source_dir/$_"} qw/changes meta.yaml/;
     die 'no changes file'   unless $dir_layout->{changes};
     die 'no meta.yaml file' unless $dir_layout->{'meta.yaml'};
-    die 'none of bin, etc, lib dirs is present' if none {$dir_layout->{$_}} qw/bin etc lib/;
+    my @main_dirs = grep {$DIR_MAP{$_}} keys %DIR_MAP;
+    die "none of dirs @main_dirs is present" if none {$dir_layout->{$_}} @main_dirs;
 
     my $meta = YAML::Load(scalar read_file("$source_dir/meta.yaml"));
     die "package is not specified" unless $meta->{package};
@@ -429,15 +440,9 @@ install:
 RULES
 
     my $main = '';
-    my %dir_map = (
-        bin => 'usr/local/bin',
-        etc => 'etc',
-        lib => 'usr/share/perl5',
-        var => 'var',
-    );
-    for my $dir (grep {$package_info->{dir_layout}->{$_}} keys %dir_map) {
-        $main .= qq[\tinstall -d \${DEST_MAIN}/$dir_map{$dir}\n];
-        $main .= qq[\trsync -a --exclude=".svn" \${SOURCE}/$dir/ \${DEST_MAIN}/$dir_map{$dir}/\n];
+    for my $dir (grep {$package_info->{dir_layout}->{$_}} keys %DIR_MAP) {
+        $main .= qq[\tinstall -d \${DEST_MAIN}/$DIR_MAP{$dir}\n];
+        $main .= qq[\trsync -a --exclude=".svn" \${SOURCE}/$dir/ \${DEST_MAIN}/$DIR_MAP{$dir}/\n];
     }
     $rules =~ s/%MAIN%/$main/;
 
