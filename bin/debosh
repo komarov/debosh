@@ -245,7 +245,7 @@ sub get_package_info
 
     die 'no changes file'   unless $dir_layout->{changes};
     die 'no meta.yaml file' unless $dir_layout->{'meta.yaml'};
-    my @main_dirs = grep {$DIR_MAP{$_}} keys %DIR_MAP;
+    my @main_dirs = keys %DIR_MAP;
     die "none of dirs @main_dirs is present" if none {$dir_layout->{$_}} @main_dirs;
 
     my $meta = YAML::Load(scalar read_file("$source_dir/meta.yaml"));
